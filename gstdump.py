@@ -27,9 +27,11 @@ from twisted.python.usage import Options as BaseOptions, UsageError
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_LINK_TIMEOUT = 2
+EXIT_EOS_TIMEOUT = 3
 
 # time in seconds
 DEFAULT_LINK_TIMEOUT = 30
+DEFAULT_EOS_TIMEOUT = 5
 
 class Codec(object):
     def __init__(self, capsName, parser=None):
@@ -80,6 +82,8 @@ class DumpService(Service):
         self.pipeline = None
         self.exitStatus = None
         self.linkTimeoutCall = None
+        self.eosTimeout = None
+        self.eosTimeoutCall = None
 
     def startService(self):
         if self.pipeline is not None:
@@ -101,6 +105,7 @@ class DumpService(Service):
 
     def busEosCb(self, bus, message):
         self.logInfo("gstreamer eos")
+        self.maybeCancelEosTimeout()
         self.shutdown(EXIT_OK)
 
     def busErrorCb(self, bus, message):
@@ -110,6 +115,8 @@ class DumpService(Service):
 
     def decodebinAutoplugContinueCb(self, decodebin, pad, caps):
         continueDecoding = not supportedCodecCaps(caps, SUPPORTED_CODECS)
+        self.logInfo("found stream %s, continue decoding %s" %
+                (caps.to_string()[:255], continueDecoding))
         return continueDecoding
 
     def decodebinPadAddedCb(self, decodebin, pad):
@@ -128,9 +135,13 @@ class DumpService(Service):
         parser.set_state(gst.STATE_PLAYING)
         queue.set_state(gst.STATE_PLAYING)
 
-        pad.link(parser.get_pad("sink"))
-        parser.link(queue)
-        queue.link(self.qtmux)
+        try:
+            pad.link(parser.get_pad("sink"))
+            parser.link(queue)
+            queue.link(self.qtmux)
+        except gst.LinkError, e:
+            self.logError("link error %s" % e)
+            reactor.callLater(0, self.shutdown, EXIT_ERROR)
 
     def decodebinNoMorePadsCb(self, decodebin):
         self.logInfo("no more pads")
@@ -205,7 +216,23 @@ class DumpService(Service):
 
     def forceEos(self):
         self.logInfo("forcing EOS")
+        self.startEosTimeout()
         self.pipeline.send_event(gst.event_new_eos())
+
+    def startEosTimeout(self):
+        assert self.eosTimeoutCall is None
+        self.eosTimeoutCall = reactor.callLater(DEFAULT_EOS_TIMEOUT,
+                self.eosTimeoutCb)
+
+    def maybeCancelEosTimeout(self):
+        if self.eosTimeoutCall is None:
+            return
+
+        self.eosTimeoutCall.cancel()
+        self.eosTimeoutCall = None
+
+    def eosTimeoutCb(self):
+        self.shutdown(EXIT_EOS_TIMEOUT)
 
 
 class Options(BaseOptions):
