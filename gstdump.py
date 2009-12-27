@@ -22,13 +22,14 @@ glib2reactor.install()
 from twisted.internet import reactor
 from twisted.application.service import IService, Service
 from twisted.python import log
+from twisted.python.usage import Options as BaseOptions, UsageError
 
-EXIT_EOS = 0
+EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_LINK_TIMEOUT = 2
 
 # time in seconds
-LINK_TIMEOUT = 30
+DEFAULT_LINK_TIMEOUT = 30
 
 class Codec(object):
     def __init__(self, capsName, parser=None):
@@ -72,9 +73,10 @@ class DumpError(Exception):
     pass
 
 class DumpService(Service):
-    def __init__(self, uri, outputFilename):
+    def __init__(self, uri, outputFilename, linkTimeout=DEFAULT_LINK_TIMEOUT):
         self.uri = uri
         self.outputFilename = outputFilename
+        self.linkTimeout = linkTimeout
         self.pipeline = None
         self.exitStatus = None
         self.linkTimeoutCall = None
@@ -89,14 +91,17 @@ class DumpService(Service):
 
         Service.startService(self)
 
-    def stopService(self):
-        self.pipeline.set_state(gst.STATE_NULL)
-
+    def stopService(self, stopReactor=False):
+        if self.pipeline is not None:
+            # shutdown() calls reactor.stop() which in turn calls
+            # stopService(). So we need to call shutdown only if shutdown hasn't
+            # been called yet.
+            self.shutdown(EXIT_OK, stopReactor)
         Service.stopService(self)
 
     def busEosCb(self, bus, message):
         self.logInfo("gstreamer eos")
-        self.shutdown(EXIT_EOS)
+        self.shutdown(EXIT_OK)
 
     def busErrorCb(self, bus, message):
         gerror, debug = message.parse_error()
@@ -117,11 +122,15 @@ class DumpService(Service):
 
         self.logInfo("found %s codec %s" % (codec.codecType, codec.capsName))
 
+        queue = gst.element_factory_make("queue")
         parser = codec.createParser()
-        self.pipeline.add(parser)
-        parser.link(self.qtmux)
-        pad.link(parser.get_pad("sink"))
+        self.pipeline.add(parser, queue)
         parser.set_state(gst.STATE_PLAYING)
+        queue.set_state(gst.STATE_PLAYING)
+
+        pad.link(parser.get_pad("sink"))
+        parser.link(queue)
+        queue.link(self.qtmux)
 
     def decodebinNoMorePadsCb(self, decodebin):
         self.logInfo("no more pads")
@@ -154,26 +163,27 @@ class DumpService(Service):
         self.pipeline.set_state(gst.STATE_NULL)
         self.pipeline = None
 
-    def shutdown(self, exitStatus):
+    def shutdown(self, exitStatus, stopReactor=True):
         exit = dict((v, k) for k, v in globals().iteritems()
                 if k.startswith("EXIT_"))[exitStatus]
         self.logInfo("shutdown %s" % exit)
         self.exitStatus = exitStatus
 
         self.cleanPipeline()
-        reactor.stop()
+        if stopReactor:
+            reactor.stop()
 
     def startLinkTimeout(self):
         assert self.linkTimeoutCall is None
-        self.linkTimeoutCall = self.callLater(LINK_TIMEOUT,
-                self.linkTimeout)
+        self.linkTimeoutCall = self.callLater(self.linkTimeout,
+                self.linkTimeoutCb)
 
     def maybeCancelLinkTimeout(self):
         if self.linkTimeoutCall is not None:
             self.linkTimeoutCall.cancel()
             self.linkTimeoutCall = None
 
-    def linkTimeout(self):
+    def linkTimeoutCb(self):
         self.logError("couldn't find any compatible streams")
         self.shutdown(EXIT_LINK_TIMEOUT)
 
@@ -187,19 +197,63 @@ class DumpService(Service):
         kwargs["isError"] = True
         log.msg("error: %s" % message, **kwargs)
 
+    def sigInt(self, sigNum, frame):
+        reactor.callFromThread(self.forceEos)
+
+    def sigUsr2(self, sigNum, frame):
+        reactor.callFromThread(self.forceEos)
+
+    def forceEos(self):
+        self.logInfo("forcing EOS")
+        self.pipeline.send_event(gst.event_new_eos())
+
+
+class Options(BaseOptions):
+    synopsis = ""
+    optParameters = [
+            ["timeout", "t", DEFAULT_LINK_TIMEOUT, "timeout"],
+        ]
+
+    optFlags = [
+            ["quiet", "q", "suppress regular output, show only errors"]
+        ]
+
+    def opt_timeout(self, timeout):
+        try:
+            self["timeout"] = int(timeout)
+        except ValueError:
+            raise UsageError("invalid timeout")
+
+    def parseArgs(self, input, output):
+        self["input"] = input
+        self["output"] = output
+
+
 if __name__ == "__main__":
     from twisted.application.service import Application
     import sys
-
-    log.startLogging(sys.stdout, setStdout=False)
+    import signal
 
     application = Application("GstDump")
 
-    dump = DumpService(sys.argv[1], sys.argv[2])
+    options = Options()
+    options.parseOptions()
+
+    if not options["quiet"]:
+        log.startLogging(sys.stdout, setStdout=False)
+
+    dump = DumpService(options["input"], options["output"], options["timeout"])
     dump.setServiceParent(application)
 
     appService = IService(application)
     reactor.callWhenRunning(appService.startService)
+    reactor.addSystemEventTrigger("before", "shutdown", appService.stopService)
+
+    # add SIGINT handler before calling reactor.run() which would otherwise
+    # install twisted's SIGINT handler
+    signal.signal(signal.SIGINT, dump.sigInt)
+    signal.signal(signal.SIGUSR2, dump.sigUsr2)
+
     reactor.run()
 
     sys.exit(dump.exitStatus)
