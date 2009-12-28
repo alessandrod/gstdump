@@ -31,11 +31,11 @@ EXIT_EOS_TIMEOUT = 3
 
 # time in seconds
 DEFAULT_LINK_TIMEOUT = 30
-DEFAULT_EOS_TIMEOUT = 5
+DEFAULT_EOS_TIMEOUT = 30
 
 class Codec(object):
-    def __init__(self, capsName, parser=None):
-        self.capsName = capsName
+    def __init__(self, caps, parser=None):
+        self.caps = gst.Caps(caps)
         self.parser = parser
 
     def createParser(self):
@@ -52,19 +52,26 @@ class AudioCodec(Codec):
 
 SUPPORTED_CODECS = [
         VideoCodec("video/x-h264", "h264parse"),
-        VideoCodec("video/mpeg"),
+        VideoCodec("video/mpeg, mpegversion={1, 2}, parsed=(boolean)false",
+                "mpegvideoparse"),
+        VideoCodec("video/mpeg, mpegversion={1, 2}, parsed=(boolean)true"),
         VideoCodec("image/jpeg"),
         VideoCodec("video/x-raw-rgb"),
         VideoCodec("video/x-raw-yuv"),
-        AudioCodec("audio/mpeg"),
+        VideoCodec("audio/mpeg, mpegversion={2, 4}, framed=(boolean)false",
+                "aacparse"),
+        VideoCodec("audio/mpeg, mpegversion={2, 4}, framed=(boolean)true"),
+        VideoCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3], "
+                "parsed=(boolean)false", "mp3parse"),
+        VideoCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3], "
+                "parsed=(boolean)true"),
         AudioCodec("audio/x-raw-int", "audioparse")
     ]
 
 def findCodecForCaps(caps, codecs):
-    for structure in caps:
-        for codec in codecs:
-            if codec.capsName == structure.get_name():
-                return codec
+    for codec in codecs:
+        if codec.caps.intersect(caps):
+            return codec
 
     return None
 
@@ -114,9 +121,13 @@ class DumpService(Service):
         self.shutdown(EXIT_ERROR)
 
     def decodebinAutoplugContinueCb(self, decodebin, pad, caps):
-        continueDecoding = not supportedCodecCaps(caps, SUPPORTED_CODECS)
+        if caps.is_fixed():
+            continueDecoding = not supportedCodecCaps(caps, SUPPORTED_CODECS)
+        else:
+            continueDecoding = True
+
         self.logInfo("found stream %s, continue decoding %s" %
-                (caps.to_string()[:255], continueDecoding))
+                (caps.to_string()[:500], continueDecoding))
         return continueDecoding
 
     def decodebinPadAddedCb(self, decodebin, pad):
@@ -127,7 +138,7 @@ class DumpService(Service):
 
         self.maybeCancelLinkTimeout()
 
-        self.logInfo("found %s codec %s" % (codec.codecType, codec.capsName))
+        self.logInfo("found %s codec %s" % (codec.codecType, codec.caps.to_string()[:500]))
 
         queue = gst.element_factory_make("queue")
         parser = codec.createParser()
@@ -141,7 +152,7 @@ class DumpService(Service):
             queue.link(self.qtmux)
         except gst.LinkError, e:
             self.logError("link error %s" % e)
-            reactor.callLater(0, self.shutdown, EXIT_ERROR)
+            self.callLater(0, self.shutdown, EXIT_ERROR)
 
     def decodebinNoMorePadsCb(self, decodebin):
         self.logInfo("no more pads")
@@ -221,7 +232,7 @@ class DumpService(Service):
 
     def startEosTimeout(self):
         assert self.eosTimeoutCall is None
-        self.eosTimeoutCall = reactor.callLater(DEFAULT_EOS_TIMEOUT,
+        self.eosTimeoutCall = self.callLater(DEFAULT_EOS_TIMEOUT,
                 self.eosTimeoutCb)
 
     def maybeCancelEosTimeout(self):
