@@ -52,19 +52,12 @@ class AudioCodec(Codec):
 
 SUPPORTED_CODECS = [
         VideoCodec("video/x-h264", "h264parse"),
-        VideoCodec("video/mpeg, mpegversion={1, 2}, parsed=(boolean)false",
-                "mpegvideoparse"),
-        VideoCodec("video/mpeg, mpegversion={1, 2}, parsed=(boolean)true"),
+        VideoCodec("video/mpeg, mpegversion={1, 2}", "mpegvideoparse"),
         VideoCodec("image/jpeg"),
-        VideoCodec("video/x-raw-rgb"),
-        VideoCodec("video/x-raw-yuv"),
-        VideoCodec("audio/mpeg, mpegversion={2, 4}, framed=(boolean)false",
-                "aacparse"),
-        VideoCodec("audio/mpeg, mpegversion={2, 4}, framed=(boolean)true"),
-        VideoCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3], "
-                "parsed=(boolean)false", "mp3parse"),
-        VideoCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3], "
-                "parsed=(boolean)true"),
+        VideoCodec("video/x-raw-rgb", "jpegenc"),
+        VideoCodec("video/x-raw-yuv", "videoparse"),
+        AudioCodec("audio/mpeg, mpegversion=(int){2, 4}", "aacparse"),
+        AudioCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3]", "mp3parse"),
         AudioCodec("audio/x-raw-int", "audioparse")
     ]
 
@@ -80,6 +73,45 @@ def supportedCodecCaps(caps, codecs):
 
 class DumpError(Exception):
     pass
+
+class UnParser(gst.Element):
+    __gstdetails__ = ("UnParser", "Parser",
+            'I unparse parsed stuff (for real)', 'Alessandro Decina')
+
+    sinktemplate = gst.PadTemplate ("sink",
+            gst.PAD_SINK, gst.PAD_ALWAYS, gst.caps_new_any())
+    srctemplate = gst.PadTemplate ("src",
+            gst.PAD_SRC, gst.PAD_ALWAYS, gst.caps_new_any())
+
+    def __init__(self):
+        gst.Element.__init__(self)
+
+        self.sinkpad = gst.Pad(self.sinktemplate)
+        self.sinkpad.set_setcaps_function(self.sink_setcaps)
+        self.sinkpad.set_chain_function(self.chain)
+        self.add_pad(self.sinkpad)
+
+        self.srcpad = gst.Pad(self.srctemplate)
+        self.add_pad(self.srcpad)
+
+    def sink_setcaps(self, pad, caps):
+        caps = gst.Caps(caps)
+        for structure in caps:
+            if structure.has_key("parsed"):
+                structure["parsed"] = False
+            if structure.has_key("framed"):
+                structure["framed"] = False
+
+        return self.srcpad.set_caps(caps)
+
+    def chain(self, pad, buf):
+        buf.set_caps(self.srcpad.props.caps)
+        res = self.srcpad.push(buf)
+        return res
+
+
+gobject.type_register(UnParser)
+gst.element_register(UnParser, "unparser", gst.RANK_MARGINAL)
 
 class DumpService(Service):
     def __init__(self, uri, outputFilename, linkTimeout=DEFAULT_LINK_TIMEOUT):
@@ -141,15 +173,19 @@ class DumpService(Service):
         self.logInfo("found %s codec %s" % (codec.codecType, codec.caps.to_string()[:500]))
 
         queue = gst.element_factory_make("queue")
+        queue.props.max_size_bytes = 0
+        queue.props.max_size_time = 0
+        queue.props.max_size_buffers = 0
+        unparser = UnParser()
         parser = codec.createParser()
-        self.pipeline.add(parser, queue)
+        self.pipeline.add(unparser, parser, queue)
+        unparser.set_state(gst.STATE_PLAYING)
         parser.set_state(gst.STATE_PLAYING)
         queue.set_state(gst.STATE_PLAYING)
 
         try:
-            pad.link(parser.get_pad("sink"))
-            parser.link(queue)
-            queue.link(self.qtmux)
+            pad.link(unparser.get_pad("sink"))
+            gst.element_link_many(unparser, parser, queue, self.qtmux)
         except gst.LinkError, e:
             self.logError("link error %s" % e)
             self.callLater(0, self.shutdown, EXIT_ERROR)
@@ -157,7 +193,7 @@ class DumpService(Service):
     def decodebinNoMorePadsCb(self, decodebin):
         self.logInfo("no more pads")
         self.qtmux.set_locked_state(False)
-        self.qtmux.sync_state_with_parent()
+        self.qtmux.set_state(gst.STATE_PLAYING)
 
     def buildPipeline(self):
         self.pipeline = gst.Pipeline()
@@ -228,6 +264,10 @@ class DumpService(Service):
     def forceEos(self):
         self.logInfo("forcing EOS")
         self.startEosTimeout()
+        self.doControlledShutdown()
+
+    def doControlledShutdown(self):
+        self.logInfo("doing regular controlled shutdown")
         self.pipeline.send_event(gst.event_new_eos())
 
     def startEosTimeout(self):
