@@ -33,16 +33,39 @@ EXIT_EOS_TIMEOUT = 3
 DEFAULT_LINK_TIMEOUT = 30
 DEFAULT_EOS_TIMEOUT = 30
 
-class Codec(object):
-    def __init__(self, caps, parser=None):
-        self.caps = gst.Caps(caps)
-        self.parser = parser
+def logInfo(message, **kwargs):
+    log.msg("info: %s" % message, **kwargs)
 
-    def createParser(self):
-        if self.parser is None:
+def logError(message, **kwargs):
+    kwargs["isError"] = True
+    log.msg("error: %s" % message, **kwargs)
+
+class Codec(object):
+    def __init__(self, caps, binDescription=None):
+        self.caps = gst.Caps(caps)
+        self.binDescription = binDescription
+
+    def createBin(self):
+        codecBin = self.createBinReal()
+        self.addProbes(codecBin)
+
+        return codecBin
+
+    def createBinReal(self):
+        if self.binDescription is None:
             return gst.element_factory_make("identity")
 
-        return gst.element_factory_make(self.parser)
+        return gst.parse_bin_from_description(self.binDescription,
+                ghost_unconnected_pads=True)
+
+    def addProbes(self, codecBin):
+        for padName in ("sink", "src"):
+            pad = codecBin.get_pad(padName)
+            pad.connect("notify::caps", self.padNotifyCaps)
+
+    def padNotifyCaps(self, pad, pspec):
+        caps = pad.props.caps
+        logInfo("pad %s changed caps %s" % (pad, caps))
 
 class VideoCodec(Codec):
     codecType = "video"
@@ -50,8 +73,103 @@ class VideoCodec(Codec):
 class AudioCodec(Codec):
     codecType = "audio"
 
+class H264Parser(gst.Element):
+    __gstdetails__ = ("h264Parser", "Filter/Video",
+            "Blah", "Alessandro Decina")
+
+    sinktemplate = gst.PadTemplate ("sink",
+            gst.PAD_SINK, gst.PAD_ALWAYS, gst.Caps("video/x-h264"))
+    srctemplate = gst.PadTemplate ("src",
+            gst.PAD_SRC, gst.PAD_ALWAYS, gst.Caps("video/x-h264"))
+
+    def __init__(self):
+        gst.Element.__init__(self)
+
+        self.sinkpad = gst.Pad(self.sinktemplate)
+        self.sinkpad.set_setcaps_function(self.sink_setcaps)
+        self.sinkpad.set_chain_function(self.chain)
+        self.add_pad(self.sinkpad)
+
+        self.srcpad = gst.Pad(self.srctemplate)
+        self.add_pad(self.srcpad)
+
+        self.buffers = []
+
+    def sink_setcaps(self, pad, caps):
+        return self.srcpad.set_caps(caps)
+
+    def chain(self, pad, buf):
+        if buf.timestamp == gst.CLOCK_TIME_NONE:
+            buf.timestamp = 0
+
+        caps = pad.props.caps
+        if caps is None or not caps[0].has_key("width"):
+            logInfo("%s incomplete caps, buffering %s" % (self, caps))
+            self.buffers.append(buf)
+            return gst.FLOW_OK
+
+        ret = gst.FLOW_OK
+        if self.buffers:
+            logInfo("%s caps complete, pushing out buffered buffers" % self)
+
+            while ret == gst.FLOW_OK:
+                try:
+                    pbuf = self.buffers.pop(0)
+                except IndexError:
+                    break
+                pbuf.set_caps(self.srcpad.props.caps)
+                ret = self.srcpad.push(pbuf)
+
+            self.buffers = []
+
+        if ret != gst.FLOW_OK:
+            return ret
+
+        buf.set_caps(self.srcpad.props.caps)
+        res = self.srcpad.push(buf)
+        return res
+
+gobject.type_register(H264Parser)
+gst.element_register(H264Parser, "twih264parse", gst.RANK_MARGINAL)
+
+class H264Codec(VideoCodec):
+    def createBinReal(self):
+        codecBin = gst.Bin()
+
+        self.h264parse = h264parse = gst.element_factory_make("h264parse")
+        twih264parse = H264Parser()
+        codecBin.add(h264parse, twih264parse)
+
+        h264parse.link(twih264parse)
+
+        sinkpad = gst.GhostPad("sink", h264parse.get_pad("sink"))
+        srcpad = gst.GhostPad("src", twih264parse.get_pad("src"))
+
+        # workaround a bug in h264parse, fixed by -bad 52f5f4
+        pad = h264parse.get_pad("src")
+        pad.connect("notify::caps", self.checkCaps)
+
+        codecBin.add_pad(sinkpad)
+        codecBin.add_pad(srcpad)
+
+        return codecBin
+
+    def checkCaps(self, pad, pspec):
+        if pad.props.caps is None or pad.props.caps[0].has_key("width"):
+            return
+
+        logInfo("pad %s setting caps again" % pad)
+        # set the caps again so they get updated again and width/height are
+        # filled with correct values
+        caps = pad.props.caps
+        caps = gst.Caps(caps)
+        caps[0]["width"] = 42
+        caps[0]["height"] = 42
+        self.h264parse.get_pad("sink").set_caps(caps)
+
+
 SUPPORTED_CODECS = [
-        VideoCodec("video/x-h264", "h264parse"),
+        H264Codec("video/x-h264"),
         VideoCodec("video/mpeg, mpegversion=(int)4", "mpeg4videoparse"),
         VideoCodec("video/mpeg, mpegversion={1, 2}", "mpegvideoparse"),
         VideoCodec("image/jpeg"),
@@ -146,13 +264,13 @@ class DumpService(Service):
         Service.stopService(self)
 
     def busEosCb(self, bus, message):
-        self.logInfo("gstreamer eos")
+        logInfo("gstreamer eos")
         self.maybeCancelEosTimeout()
         self.shutdown(EXIT_OK)
 
     def busErrorCb(self, bus, message):
         gerror, debug = message.parse_error()
-        self.logError("gstreamer error %s %s" % (gerror.message, debug))
+        logError("gstreamer error %s %s" % (gerror.message, debug))
         self.shutdown(EXIT_ERROR)
 
     def decodebinAutoplugContinueCb(self, decodebin, pad, caps):
@@ -161,7 +279,7 @@ class DumpService(Service):
         else:
             continueDecoding = True
 
-        self.logInfo("found stream %s, continue decoding %s" %
+        logInfo("found stream %s, continue decoding %s" %
                 (caps.to_string()[:500], continueDecoding))
         return continueDecoding
 
@@ -173,41 +291,32 @@ class DumpService(Service):
 
         self.maybeCancelLinkTimeout()
 
-        self.logInfo("found %s codec %s" % (codec.codecType, codec.caps.to_string()[:500]))
+        logInfo("found %s codec %s" % (codec.codecType, codec.caps.to_string()[:500]))
 
         queue = gst.element_factory_make("queue")
         queue.props.max_size_bytes = 0
         queue.props.max_size_time = 0
         queue.props.max_size_buffers = 0
         unparser = UnParser()
-        parser = codec.createParser()
-        self.pipeline.add(unparser, parser, queue)
+        codecBin = codec.createBin()
+        self.pipeline.add(unparser, codecBin, queue)
         unparser.set_state(gst.STATE_PLAYING)
-        parser.set_state(gst.STATE_PLAYING)
+        codecBin.set_state(gst.STATE_PLAYING)
         queue.set_state(gst.STATE_PLAYING)
 
         try:
             pad.link(unparser.get_pad("sink"))
-            gst.element_link_many(unparser, parser, queue, self.muxer)
+            gst.element_link_many(unparser, codecBin, queue, self.muxer)
         except gst.LinkError, e:
-            self.logError("link error %s" % e)
+            logError("link error %s" % e)
             self.callLater(0, self.shutdown, EXIT_ERROR)
 
         pad = queue.get_pad("src")
         pad.set_blocked_async(True, self.padBlockedCb)
-        if "h264" in codec.caps.to_string():
-            pad.add_buffer_probe(self.h264ProbeCb)
-
         self.blockedPads.append(pad)
 
-    def h264ProbeCb(self, pad, buf):
-        if buf.timestamp == gst.CLOCK_TIME_NONE:
-            buf.timestamp = 0
-
-        return True
-
     def decodebinNoMorePadsCb(self, decodebin):
-        self.logInfo("no more pads")
+        logInfo("no more pads")
         self.muxer.set_locked_state(False)
         self.muxer.set_state(gst.STATE_PLAYING)
 
@@ -217,9 +326,9 @@ class DumpService(Service):
 
     def padBlockedCb(self, pad, blocked):
         if blocked:
-            self.logInfo("blocked pad %s" % pad)
+            logInfo("blocked pad %s" % pad)
         else:
-            self.logInfo("unblocked pad %s" % pad)
+            logInfo("unblocked pad %s" % pad)
 
     def buildPipeline(self):
         self.pipeline = gst.Pipeline()
@@ -250,7 +359,7 @@ class DumpService(Service):
     def shutdown(self, exitStatus, stopReactor=True):
         exit = dict((v, k) for k, v in globals().iteritems()
                 if k.startswith("EXIT_"))[exitStatus]
-        self.logInfo("shutdown %s" % exit)
+        logInfo("shutdown %s" % exit)
         self.exitStatus = exitStatus
 
         self.cleanPipeline()
@@ -268,18 +377,11 @@ class DumpService(Service):
             self.linkTimeoutCall = None
 
     def linkTimeoutCb(self):
-        self.logError("couldn't find any compatible streams")
+        logError("couldn't find any compatible streams")
         self.shutdown(EXIT_LINK_TIMEOUT)
 
     def callLater(self, seconds, callable, *args, **kwargs):
         return reactor.callLater(seconds, callable, *args, **kwargs)
-
-    def logInfo(self, message, **kwargs):
-        log.msg("info: %s" % message, **kwargs)
-
-    def logError(self, message, **kwargs):
-        kwargs["isError"] = True
-        log.msg("error: %s" % message, **kwargs)
 
     def sigInt(self, sigNum, frame):
         reactor.callFromThread(self.forceEos)
@@ -288,12 +390,12 @@ class DumpService(Service):
         reactor.callFromThread(self.forceEos)
 
     def forceEos(self):
-        self.logInfo("forcing EOS")
+        logInfo("forcing EOS")
         self.startEosTimeout()
         self.doControlledShutdown()
 
     def doControlledShutdown(self):
-        self.logInfo("doing regular controlled shutdown")
+        logInfo("doing regular controlled shutdown")
         #self.pipeline.send_event(gst.event_new_eos())
         for pad in self.muxer.sink_pads():
             pad.send_event(gst.event_new_eos())
