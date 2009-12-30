@@ -54,11 +54,11 @@ SUPPORTED_CODECS = [
         VideoCodec("video/x-h264", "h264parse"),
         VideoCodec("video/mpeg, mpegversion={1, 2}", "mpegvideoparse"),
         VideoCodec("image/jpeg"),
-        VideoCodec("video/x-raw-rgb", "jpegenc"),
+        VideoCodec("video/x-raw-rgb", "ffenc_mpeg2video"),
         VideoCodec("video/x-raw-yuv", "videoparse"),
-        AudioCodec("audio/mpeg, mpegversion=(int){2, 4}", "aacparse"),
+        #AudioCodec("audio/mpeg, mpegversion=(int){2, 4}"),
         AudioCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3]", "mp3parse"),
-        AudioCodec("audio/x-raw-int", "audioparse")
+        AudioCodec("audio/x-raw-int", "faac")
     ]
 
 def findCodecForCaps(caps, codecs):
@@ -105,6 +105,7 @@ class UnParser(gst.Element):
         return self.srcpad.set_caps(caps)
 
     def chain(self, pad, buf):
+        #print self, "pushing", buf.size
         buf.set_caps(self.srcpad.props.caps)
         res = self.srcpad.push(buf)
         return res
@@ -123,6 +124,7 @@ class DumpService(Service):
         self.linkTimeoutCall = None
         self.eosTimeout = None
         self.eosTimeoutCall = None
+        self.blockedPads = []
 
     def startService(self):
         if self.pipeline is not None:
@@ -190,10 +192,33 @@ class DumpService(Service):
             self.logError("link error %s" % e)
             self.callLater(0, self.shutdown, EXIT_ERROR)
 
+        pad = queue.get_pad("src")
+        pad.set_blocked_async(True, self.padBlockedCb)
+        if "h264" in codec.caps.to_string():
+            pad.add_buffer_probe(self.h264ProbeCb)
+
+        self.blockedPads.append(pad)
+
+    def h264ProbeCb(self, pad, buf):
+        if buf.timestamp == gst.CLOCK_TIME_NONE:
+            return False
+
+        return True
+
     def decodebinNoMorePadsCb(self, decodebin):
         self.logInfo("no more pads")
         self.qtmux.set_locked_state(False)
         self.qtmux.set_state(gst.STATE_PLAYING)
+
+        blockedPads, self.blockedPads = self.blockedPads, []
+        for pad in blockedPads:
+            pad.set_blocked_async(False, self.padBlockedCb)
+
+    def padBlockedCb(self, pad, blocked):
+        if blocked:
+            self.logInfo("blocked pad %s" % pad)
+        else:
+            self.logInfo("unblocked pad %s" % pad)
 
     def buildPipeline(self):
         self.pipeline = gst.Pipeline()
@@ -268,7 +293,9 @@ class DumpService(Service):
 
     def doControlledShutdown(self):
         self.logInfo("doing regular controlled shutdown")
-        self.pipeline.send_event(gst.event_new_eos())
+        #self.pipeline.send_event(gst.event_new_eos())
+        for pad in self.qtmux.sink_pads():
+            pad.send_event(gst.event_new_eos())
 
     def startEosTimeout(self):
         assert self.eosTimeoutCall is None
