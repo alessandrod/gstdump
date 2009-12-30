@@ -187,7 +187,7 @@ class DumpService(Service):
 
         try:
             pad.link(unparser.get_pad("sink"))
-            gst.element_link_many(unparser, parser, queue, self.qtmux)
+            gst.element_link_many(unparser, parser, queue, self.muxer)
         except gst.LinkError, e:
             self.logError("link error %s" % e)
             self.callLater(0, self.shutdown, EXIT_ERROR)
@@ -201,14 +201,14 @@ class DumpService(Service):
 
     def h264ProbeCb(self, pad, buf):
         if buf.timestamp == gst.CLOCK_TIME_NONE:
-            return False
+            buf.timestamp = 0
 
         return True
 
     def decodebinNoMorePadsCb(self, decodebin):
         self.logInfo("no more pads")
-        self.qtmux.set_locked_state(False)
-        self.qtmux.set_state(gst.STATE_PLAYING)
+        self.muxer.set_locked_state(False)
+        self.muxer.set_state(gst.STATE_PLAYING)
 
         blockedPads, self.blockedPads = self.blockedPads, []
         for pad in blockedPads:
@@ -234,13 +234,13 @@ class DumpService(Service):
         self.uridecodebin.connect("pad-added", self.decodebinPadAddedCb)
         self.uridecodebin.connect("no-more-pads", self.decodebinNoMorePadsCb)
 
-        self.qtmux = gst.element_factory_make("qtmux")
-        self.qtmux.set_locked_state(True)
+        self.muxer = gst.element_factory_make("flvmux")
+        self.muxer.set_locked_state(True)
         self.filesink = gst.element_factory_make("filesink")
         self.filesink.props.location = self.outputFilename
 
-        self.pipeline.add(self.uridecodebin, self.qtmux, self.filesink)
-        gst.element_link_many(self.qtmux, self.filesink)
+        self.pipeline.add(self.uridecodebin, self.muxer, self.filesink)
+        gst.element_link_many(self.muxer, self.filesink)
 
     def cleanPipeline(self):
         self.pipeline.set_state(gst.STATE_NULL)
@@ -294,7 +294,7 @@ class DumpService(Service):
     def doControlledShutdown(self):
         self.logInfo("doing regular controlled shutdown")
         #self.pipeline.send_event(gst.event_new_eos())
-        for pad in self.qtmux.sink_pads():
+        for pad in self.muxer.sink_pads():
             pad.send_event(gst.event_new_eos())
 
     def startEosTimeout(self):
