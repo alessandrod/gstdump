@@ -52,6 +52,7 @@ class AudioCodec(Codec):
 
 SUPPORTED_CODECS = [
         VideoCodec("video/x-h264", "h264parse"),
+        VideoCodec("video/mpeg, mpegversion=(int)4", "mpeg4videoparse"),
         VideoCodec("video/mpeg, mpegversion={1, 2}", "mpegvideoparse"),
         VideoCodec("image/jpeg"),
         VideoCodec("video/x-raw-rgb", "ffenc_mpeg2video"),
@@ -234,7 +235,7 @@ class DumpService(Service):
         self.uridecodebin.connect("pad-added", self.decodebinPadAddedCb)
         self.uridecodebin.connect("no-more-pads", self.decodebinNoMorePadsCb)
 
-        self.muxer = gst.element_factory_make("flvmux")
+        self.muxer = gst.element_factory_make("qtmux")
         self.muxer.set_locked_state(True)
         self.filesink = gst.element_factory_make("filesink")
         self.filesink.props.location = self.outputFilename
