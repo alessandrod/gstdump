@@ -167,6 +167,82 @@ class H264Codec(VideoCodec):
         caps[0]["height"] = 42
         self.h264parse.get_pad("sink").set_caps(caps)
 
+class FixTimestamps(gst.Element):
+    __gstdetails__ = ("FixTimestamps", "Filter",
+            "Blah", "Alessandro Decina")
+
+    sinktemplate = gst.PadTemplate ("sink",
+            gst.PAD_SINK, gst.PAD_ALWAYS, gst.Caps("ANY"))
+    srctemplate = gst.PadTemplate ("src",
+            gst.PAD_SRC, gst.PAD_ALWAYS, gst.Caps("ANY"))
+
+    def __init__(self):
+        gst.Element.__init__(self)
+
+        self.sinkpad = gst.Pad(self.sinktemplate)
+        self.sinkpad.set_event_function(self.sink_event)
+        self.sinkpad.set_setcaps_function(self.sink_setcaps)
+        self.sinkpad.set_chain_function(self.chain)
+        self.add_pad(self.sinkpad)
+
+        self.srcpad = gst.Pad(self.srctemplate)
+        self.add_pad(self.srcpad)
+
+        self.last_timestamp = 0
+        self.last_duration = 0
+        self.pending_buf = None
+
+    def sink_event(self, pad, event):
+        if event.type == gst.EVENT_FLUSH_START:
+            self.pending_buf = None
+            self.last_timestamp = 0
+            self.last_duration = 0
+
+        return self.sinkpad.event_default(event)
+
+    def sink_setcaps(self, pad, caps):
+        return self.srcpad.set_caps(caps)
+
+    def chain(self, pad, buf):
+        if self.pending_buf is not None:
+            if self.pending_buf.timestamp == gst.CLOCK_TIME_NONE:
+                self.pending_buf.timestamp = \
+                        self.last_timestamp + self.last_duration
+
+            if self.pending_buf.duration == gst.CLOCK_TIME_NONE:
+                self.pending_buf.duration = \
+                        buf.timestamp - self.pending_buf.timestamp
+
+            self.last_timestamp = self.pending_buf.timestamp
+            self.last_duration = self.pending_buf.duration
+
+            ret = self.srcpad.push(self.pending_buf)
+            self.pending_buf = buf
+        else:
+            self.pending_buf = buf
+            ret = gst.FLOW_OK
+
+        return ret
+gobject.type_register(FixTimestamps)
+gst.element_register(FixTimestamps, "fixtimestamps", gst.RANK_MARGINAL)
+
+class RawIntAudioCodec(AudioCodec):
+    def createBinReal(self):
+        codecBin = gst.Bin()
+        encoder = gst.element_factory_make("faac")
+        fixTimestamps = FixTimestamps()
+
+        codecBin.add(encoder, fixTimestamps)
+        encoder.link(fixTimestamps)
+
+        sinkpad = gst.GhostPad("sink", encoder.get_pad("sink"))
+        srcpad = gst.GhostPad("src", fixTimestamps.get_pad("src"))
+
+        codecBin.add_pad(sinkpad)
+        codecBin.add_pad(srcpad)
+
+        return codecBin
+
 
 SUPPORTED_CODECS = [
         H264Codec("video/x-h264"),
@@ -177,7 +253,8 @@ SUPPORTED_CODECS = [
         VideoCodec("video/x-raw-yuv", "videoparse"),
         #AudioCodec("audio/mpeg, mpegversion=(int){2, 4}"),
         AudioCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3]", "mp3parse"),
-        AudioCodec("audio/x-raw-int", "faac")
+        #AudioCodec("audio/x-raw-int", "faac"),
+        RawIntAudioCodec("audio/x-raw-int"),
     ]
 
 def findCodecForCaps(caps, codecs):
