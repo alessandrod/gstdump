@@ -99,9 +99,6 @@ class H264Parser(gst.Element):
         return self.srcpad.set_caps(caps)
 
     def chain(self, pad, buf):
-        if buf.timestamp == gst.CLOCK_TIME_NONE:
-            buf.timestamp = 0
-
         caps = pad.props.caps
         if caps is None or not caps[0].has_key("width"):
             logInfo("%s incomplete caps, buffering %s" % (self, caps))
@@ -138,12 +135,14 @@ class H264Codec(VideoCodec):
 
         self.h264parse = h264parse = gst.element_factory_make("h264parse")
         twih264parse = H264Parser()
-        codecBin.add(h264parse, twih264parse)
+        fixTimestamps = FixTimestamps()
+        codecBin.add(h264parse, twih264parse, fixTimestamps)
 
         h264parse.link(twih264parse)
+        twih264parse.link(fixTimestamps)
 
         sinkpad = gst.GhostPad("sink", h264parse.get_pad("sink"))
-        srcpad = gst.GhostPad("src", twih264parse.get_pad("src"))
+        srcpad = gst.GhostPad("src", fixTimestamps.get_pad("src"))
 
         # workaround a bug in h264parse, fixed by -bad 52f5f4
         pad = h264parse.get_pad("src")
@@ -216,6 +215,7 @@ class FixTimestamps(gst.Element):
             self.last_timestamp = self.pending_buf.timestamp
             self.last_duration = self.pending_buf.duration
 
+            self.pending_buf.set_caps(self.srcpad.props.caps)
             ret = self.srcpad.push(self.pending_buf)
             self.pending_buf = buf
         else:
@@ -251,7 +251,7 @@ SUPPORTED_CODECS = [
         VideoCodec("image/jpeg"),
         VideoCodec("video/x-raw-rgb", "ffenc_mpeg2video"),
         VideoCodec("video/x-raw-yuv", "videoparse"),
-        #AudioCodec("audio/mpeg, mpegversion=(int){2, 4}"),
+        #AudioCodec("audio/mpeg, mpegversion=(int){2, 4}", "aacparse"),
         AudioCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3]", "mp3parse"),
         #AudioCodec("audio/x-raw-int", "faac"),
         RawIntAudioCodec("audio/x-raw-int"),
@@ -383,14 +383,29 @@ class DumpService(Service):
 
         try:
             pad.link(unparser.get_pad("sink"))
-            gst.element_link_many(unparser, codecBin, queue, self.muxer)
+            gst.element_link_many(unparser, codecBin, queue)
         except gst.LinkError, e:
-            logError("link error %s" % e)
+            logError("couldn't link unparser codecBin and queue %s" % e)
             self.callLater(0, self.shutdown, EXIT_ERROR)
 
-        pad = queue.get_pad("src")
-        pad.set_blocked_async(True, self.padBlockedCb)
-        self.blockedPads.append(pad)
+            return
+
+        queuePad = queue.get_pad("src")
+        if codec.codecType == 'audio':
+            name = "audio_%d"
+        else:
+            name = "video_%d"
+        muxerPad = self.muxer.get_request_pad(name)
+        try:
+            queuePad.link(muxerPad)
+        except gst.LinkError, e:
+            logError("couldn't link to muxer %s" % e)
+            self.callLater(0, self.shutdown, EXIT_ERROR)
+
+            return
+
+        queuePad.set_blocked_async(True, self.padBlockedCb)
+        self.blockedPads.append(queuePad)
 
     def decodebinNoMorePadsCb(self, decodebin):
         logInfo("no more pads")
