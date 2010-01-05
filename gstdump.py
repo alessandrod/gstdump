@@ -570,8 +570,13 @@ if __name__ == "__main__":
 
     application = Application("GstDump")
 
-    options = Options()
-    options.parseOptions()
+    try:
+        options = Options()
+        options.parseOptions()
+    except UsageError, e:
+        sys.stderr.write("error: %s\n" %e)
+
+        sys.exit(EXIT_ERROR)
 
     if not options["quiet"]:
         log.startLogging(sys.stdout, setStdout=False)
