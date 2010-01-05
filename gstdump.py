@@ -187,15 +187,24 @@ class FixTimestamps(gst.Element):
         self.srcpad = gst.Pad(self.srctemplate)
         self.add_pad(self.srcpad)
 
-        self.last_timestamp = 0
-        self.last_duration = 0
-        self.pending_buf = None
+        self.reset()
+
+    def reset(self):
+        self.segment = gst.Segment()
+        self.prev_buf = None
+        self.expected_ts = gst.CLOCK_TIME_NONE
 
     def sink_event(self, pad, event):
-        if event.type == gst.EVENT_FLUSH_START:
-            self.pending_buf = None
-            self.last_timestamp = 0
-            self.last_duration = 0
+        if event.type == gst.EVENT_NEWSEGMENT:
+            tup = event.parse_new_segment_full()
+            update, rate, applied_rate, fmt, start, stop, time = tup
+            self.segment.set_newsegment_full(update, rate, applied_rate, fmt,
+                    start, stop, time)
+
+            self.expected_ts = start
+
+        elif event.type == gst.EVENT_FLUSH_STOP:
+            self.reset()
 
         return self.sinkpad.event_default(event)
 
@@ -203,26 +212,48 @@ class FixTimestamps(gst.Element):
         return self.srcpad.set_caps(caps)
 
     def chain(self, pad, buf):
-        if self.pending_buf is not None:
-            if self.pending_buf.timestamp == gst.CLOCK_TIME_NONE:
-                self.pending_buf.timestamp = \
-                        self.last_timestamp + self.last_duration
+        if self.expected_ts == gst.CLOCK_TIME_NONE:
+            logError("no expected ts... no NEWSEGMENT")
 
-            if self.pending_buf.duration == gst.CLOCK_TIME_NONE:
-                self.pending_buf.duration = \
-                        buf.timestamp - self.pending_buf.timestamp
+            return gst.FLOW_UNEXPECTED
 
-            self.last_timestamp = self.pending_buf.timestamp
-            self.last_duration = self.pending_buf.duration
+        gst_time = gst.TIME_ARGS
 
-            self.pending_buf.set_caps(self.srcpad.props.caps)
-            ret = self.srcpad.push(self.pending_buf)
-            self.pending_buf = buf
-        else:
-            self.pending_buf = buf
-            ret = gst.FLOW_OK
+        if self.prev_buf is None:
+            self.prev_buf = buf
 
-        return ret
+            return gst.FLOW_OK
+
+        prev_buf = self.prev_buf
+        self.prev_buf = buf
+
+        if prev_buf.timestamp == gst.CLOCK_TIME_NONE:
+            prev_buf.timestamp = self.expected_ts
+
+        elif prev_buf.timestamp != self.expected_ts:
+            if prev_buf.timestamp > self.expected_ts:
+                diff = prev_buf.timestamp - self.expected_ts
+            else:
+                diff = self.expected_ts - prev_buf.timestamp
+
+            if diff > buf.timestamp or diff > 1 * gst.SECOND:
+                logInfo("expected %s got %s" % (gst_time(prev_buf.timestamp),
+                        gst_time(self.expected_ts)))
+
+                self.prev_buf = buf
+                self.expected_ts = self.segment.start
+
+                return gst.FLOW_OK
+
+        if prev_buf.duration == gst.CLOCK_TIME_NONE:
+            duration = buf.timestamp - prev_buf.timestamp
+            prev_buf.duration = duration
+
+        self.expected_ts = prev_buf.timestamp + prev_buf.duration
+
+        prev_buf.set_caps(self.srcpad.props.caps)
+        return self.srcpad.push(prev_buf)
+
 gobject.type_register(FixTimestamps)
 gst.element_register(FixTimestamps, "fixtimestamps", gst.RANK_MARGINAL)
 
