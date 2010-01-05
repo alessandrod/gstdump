@@ -310,16 +310,40 @@ class UnParser(gst.Element):
 gobject.type_register(UnParser)
 gst.element_register(UnParser, "unparser", gst.RANK_MARGINAL)
 
+class TimeoutCall(object):
+    call = None
+
+    def __init__(self, timeout, callback, *args, **kw):
+        self.timeout = timeout
+        self.callback = callback
+        self.args = args
+        self.kw = kw
+
+    def start(self):
+        assert self.call is None
+        self.call = self.callLater(self.timeout, self.callback,
+                *self.args, **self.kw)
+
+    def cancel(self):
+        if self.call is None:
+            return
+
+        self.call.cancel()
+        self.call = None
+
+    def callLater(self, timeout, callback, *args, **kw):
+        return reactor.callLater(timeout, callback, *args, **kw)
+
+
 class DumpService(Service):
-    def __init__(self, uri, outputFilename, linkTimeout=DEFAULT_LINK_TIMEOUT):
+    def __init__(self, uri, outputFilename, linkTimeout=DEFAULT_LINK_TIMEOUT,
+            eosTimeout=DEFAULT_EOS_TIMEOUT):
         self.uri = uri
         self.outputFilename = outputFilename
-        self.linkTimeout = linkTimeout
         self.pipeline = None
         self.exitStatus = None
-        self.linkTimeoutCall = None
-        self.eosTimeout = None
-        self.eosTimeoutCall = None
+        self.linkTimeout = TimeoutCall(linkTimeout, self.linkTimeoutCb)
+        self.eosTimeout = TimeoutCall(eosTimeout, self.eosTimeoutCb)
         self.blockedPads = []
 
     def startService(self):
@@ -327,8 +351,9 @@ class DumpService(Service):
             raise DumpError("dump already started")
 
         self.buildPipeline()
+
+        self.linkTimeout.start()
         self.pipeline.set_state(gst.STATE_PLAYING)
-        self.startLinkTimeout()
 
         Service.startService(self)
 
@@ -342,12 +367,12 @@ class DumpService(Service):
 
     def busEosCb(self, bus, message):
         logInfo("gstreamer eos")
-        self.maybeCancelEosTimeout()
+        self.eosTimeout.cancel()
         self.shutdown(EXIT_OK)
 
     def busErrorCb(self, bus, message):
         gerror, debug = message.parse_error()
-        logError("gstreamer error %s %s" % (gerror.message, debug))
+        logError("gstreamer %s %s" % (gerror.message, debug))
         self.shutdown(EXIT_ERROR)
 
     def decodebinAutoplugContinueCb(self, decodebin, pad, caps):
@@ -366,7 +391,7 @@ class DumpService(Service):
         if codec is None:
             return
 
-        self.maybeCancelLinkTimeout()
+        self.linkTimeout.cancel()
 
         logInfo("found %s codec %s" % (codec.codecType, codec.caps.to_string()[:500]))
 
@@ -458,16 +483,6 @@ class DumpService(Service):
         if stopReactor:
             reactor.stop()
 
-    def startLinkTimeout(self):
-        assert self.linkTimeoutCall is None
-        self.linkTimeoutCall = self.callLater(self.linkTimeout,
-                self.linkTimeoutCb)
-
-    def maybeCancelLinkTimeout(self):
-        if self.linkTimeoutCall is not None:
-            self.linkTimeoutCall.cancel()
-            self.linkTimeoutCall = None
-
     def linkTimeoutCb(self):
         logError("couldn't find any compatible streams")
         self.shutdown(EXIT_LINK_TIMEOUT)
@@ -483,7 +498,7 @@ class DumpService(Service):
 
     def forceEos(self):
         logInfo("forcing EOS")
-        self.startEosTimeout()
+        self.eosTimeout.start()
         self.doControlledShutdown()
 
     def doControlledShutdown(self):
@@ -491,18 +506,6 @@ class DumpService(Service):
         #self.pipeline.send_event(gst.event_new_eos())
         for pad in self.muxer.sink_pads():
             pad.send_event(gst.event_new_eos())
-
-    def startEosTimeout(self):
-        assert self.eosTimeoutCall is None
-        self.eosTimeoutCall = self.callLater(DEFAULT_EOS_TIMEOUT,
-                self.eosTimeoutCb)
-
-    def maybeCancelEosTimeout(self):
-        if self.eosTimeoutCall is None:
-            return
-
-        self.eosTimeoutCall.cancel()
-        self.eosTimeoutCall = None
 
     def eosTimeoutCb(self):
         self.shutdown(EXIT_EOS_TIMEOUT)
