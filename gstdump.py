@@ -31,7 +31,7 @@ EXIT_EOS_TIMEOUT = 3
 
 # time in seconds
 DEFAULT_LINK_TIMEOUT = 30
-DEFAULT_EOS_TIMEOUT = 30
+DEFAULT_EOS_TIMEOUT = 5
 
 def logInfo(message, **kwargs):
     log.msg("info: %s" % message, **kwargs)
@@ -493,6 +493,7 @@ class DumpService(Service):
         self.uridecodebin.connect("no-more-pads", self.decodebinNoMorePadsCb)
 
         self.muxer = gst.element_factory_make("qtmux")
+        self.muxer.props.faststart = True
         self.muxer.set_locked_state(True)
         self.filesink = gst.element_factory_make("filesink")
         self.filesink.props.location = self.outputFilename
