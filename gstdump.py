@@ -134,6 +134,7 @@ class H264Codec(VideoCodec):
         codecBin = gst.Bin()
 
         self.h264parse = h264parse = gst.element_factory_make("h264parse")
+        self.h264parse.props.output_format = 0
         twih264parse = H264Parser()
         fixTimestamps = FixTimestamps()
         codecBin.add(h264parse, twih264parse, fixTimestamps)
