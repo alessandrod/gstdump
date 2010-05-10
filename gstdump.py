@@ -8,6 +8,8 @@
 #
 # Author: Alessandro Decina <alessandro.d@gmail.com>
 
+import os
+
 import pygtk
 pygtk.require("2.0")
 import gobject
@@ -281,8 +283,8 @@ SUPPORTED_CODECS = [
         VideoCodec("video/mpeg, mpegversion=(int)4", "mpeg4videoparse"),
         VideoCodec("video/mpeg, mpegversion={1, 2}", "mpegvideoparse"),
         VideoCodec("image/jpeg"),
-        VideoCodec("video/x-raw-rgb", "ffenc_mpeg2video"),
-        VideoCodec("video/x-raw-yuv", "videoparse"),
+        VideoCodec("video/x-raw-rgb", "ffmpegcolorspace ! x264enc"),
+        VideoCodec("video/x-raw-yuv", "ffmpegcolorspace ! x264enc"),
         #AudioCodec("audio/mpeg, mpegversion=(int){2, 4}", "aacparse"),
         AudioCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3]", "mp3parse"),
         #AudioCodec("audio/x-raw-int", "faac"),
@@ -400,6 +402,8 @@ class DumpService(Service):
     def busEosCb(self, bus, message):
         logInfo("gstreamer eos")
         self.eosTimeout.cancel()
+        fast_start = self.muxer.props.faststart_file
+        os.unlink(fast_start)
         self.shutdown(EXIT_OK)
 
     def busErrorCb(self, bus, message):
