@@ -307,7 +307,9 @@ class FixTimestamps(gst.Element):
 
                 return gst.FLOW_OK
 
-        if prev_buf.duration == gst.CLOCK_TIME_NONE:
+        if prev_buf.duration == gst.CLOCK_TIME_NONE \
+                and buf.timestamp != gst.CLOCK_TIME_NONE \
+                and buf.timestamp > prev_buf.timestamp:
             duration = buf.timestamp - prev_buf.timestamp
             prev_buf.duration = duration
 
