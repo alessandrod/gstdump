@@ -138,7 +138,8 @@ class H264Codec(VideoCodec):
         self.h264parse = h264parse = gst.element_factory_make("h264parse")
         self.h264parse.props.output_format = 0
         twih264parse = H264Parser()
-        fixTimestamps = FixTimestamps()
+        fixTimestamps = gst.element_factory_make("identity")
+        fixTimestamps.props.single_segment = True
         codecBin.add(h264parse, twih264parse, fixTimestamps)
 
         h264parse.link(twih264parse)
@@ -264,7 +265,8 @@ class RawIntAudioCodec(AudioCodec):
     def createBinReal(self):
         codecBin = gst.Bin()
         encoder = gst.element_factory_make("faac")
-        fixTimestamps = FixTimestamps()
+        fixTimestamps = gst.element_factory_make("identity")
+        fixTimestamps.props.single_segment = True
 
         codecBin.add(encoder, fixTimestamps)
         encoder.link(fixTimestamps)
