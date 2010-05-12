@@ -48,10 +48,20 @@ class Codec(object):
         self.binDescription = binDescription
 
     def createBin(self):
+        bin_element = gst.Bin()
         codecBin = self.createBinReal()
-        self.addProbes(codecBin)
 
-        return codecBin
+        logTimestamps = LogTimestamps()
+        bin_element.add(codecBin, logTimestamps)
+        codecBin.link(logTimestamps)
+
+        sinkpad = gst.GhostPad("sink", codecBin.get_pad("sink"))
+        srcpad = gst.GhostPad("src", logTimestamps.get_pad("src"))
+        bin_element.add_pad(sinkpad)
+        bin_element.add_pad(srcpad)
+
+        self.addProbes(bin_element)
+        return bin_element
 
     def createBinReal(self):
         if self.binDescription is None:
@@ -168,6 +178,55 @@ class H264Codec(VideoCodec):
         caps[0]["width"] = 42
         caps[0]["height"] = 42
         self.h264parse.get_pad("sink").set_caps(caps)
+
+class LogTimestamps(gst.Element):
+    __gstdetails__ = ("LogTimestamps", "Filter",
+            "Blah", "Alessandro Decina")
+
+    sinktemplate = gst.PadTemplate ("sink",
+            gst.PAD_SINK, gst.PAD_ALWAYS, gst.Caps("ANY"))
+    srctemplate = gst.PadTemplate ("src",
+            gst.PAD_SRC, gst.PAD_ALWAYS, gst.Caps("ANY"))
+
+    def __init__(self):
+        gst.Element.__init__(self)
+
+        self.sinkpad = gst.Pad(self.sinktemplate)
+        self.sinkpad.set_event_function(self.sink_event)
+        self.sinkpad.set_setcaps_function(self.sink_setcaps)
+        self.sinkpad.set_chain_function(self.chain)
+        self.add_pad(self.sinkpad)
+
+        self.srcpad = gst.Pad(self.srctemplate)
+        self.add_pad(self.srcpad)
+
+        self.reset()
+
+    def reset(self):
+        self.segment = gst.Segment()
+        self.log_ts = gst.CLOCK_TIME_NONE
+        self.log_interval = 30 * gst.SECOND
+
+    def sink_event(self, pad, event):
+        if event.type == gst.EVENT_FLUSH_STOP:
+            self.reset()
+
+        return self.sinkpad.event_default(event)
+
+    def sink_setcaps(self, pad, caps):
+        return self.srcpad.set_caps(caps)
+
+    def chain(self, pad, buf):
+        ts = buf.timestamp
+        if self.log_ts == gst.CLOCK_TIME_NONE or ts >= self.log_ts:
+            self.log_ts = ts + self.log_interval
+            logInfo("now at %s" % gst.TIME_ARGS(ts))
+
+        return self.srcpad.push(buf)
+
+gobject.type_register(LogTimestamps)
+gst.element_register(LogTimestamps, "logtimestamps", gst.RANK_MARGINAL)
+
 
 class FixTimestamps(gst.Element):
     __gstdetails__ = ("FixTimestamps", "Filter",
