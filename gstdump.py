@@ -19,9 +19,9 @@ import pygst
 pygst.require("0.10")
 import gst
 
-from twisted.internet import glib2reactor
-glib2reactor.install()
-from twisted.internet import reactor
+#from twisted.internet import glib2reactor
+#glib2reactor.install()
+from twisted.internet import reactor, defer, threads
 from twisted.application.service import IService, Service
 from twisted.python import log
 from twisted.python.usage import Options as BaseOptions, UsageError
@@ -34,6 +34,20 @@ EXIT_EOS_TIMEOUT = 3
 # time in seconds
 DEFAULT_LINK_TIMEOUT = 30
 DEFAULT_EOS_TIMEOUT = 5
+DEFAULT_MUXER = "qt"
+
+muxerTemplates = {
+    "qtmux": {"audio": "audio_%d", "video": "video_%d"},
+    "flvmux": {"audio": "audio", "video": "video"}
+}
+
+def exitStatusName(exitStatus):
+    try:
+        exit = dict((v, k) for k, v in globals().iteritems()
+                if k.startswith("EXIT_"))[exitStatus]
+    except KeyError:
+        exit = "UNKNOWN_ERROR: %s" % exitStatus
+    return exit
 
 def logInfo(message, **kwargs):
     log.msg("info: %s" % message, **kwargs)
@@ -289,23 +303,26 @@ class FixTimestamps(gst.Element):
         prev_buf = self.prev_buf
         self.prev_buf = buf
 
-        if prev_buf.timestamp == gst.CLOCK_TIME_NONE:
+        if prev_buf.timestamp == gst.CLOCK_TIME_NONE \
+                or prev_buf.timestamp > buf.timestamp:
             prev_buf.timestamp = self.expected_ts
 
-        elif prev_buf.timestamp != self.expected_ts:
-            if prev_buf.timestamp > self.expected_ts:
-                diff = prev_buf.timestamp - self.expected_ts
-            else:
-                diff = self.expected_ts - prev_buf.timestamp
+        #elif prev_buf.timestamp != self.expected_ts:
+            #if prev_buf.timestamp > self.expected_ts:
+            #    diff = prev_buf.timestamp - self.expected_ts
+            #else:
+            #    diff = self.expected_ts - prev_buf.timestamp
 
-            if diff > buf.timestamp or diff > 1 * gst.SECOND:
-                logInfo("expected %s got %s" % (gst_time(prev_buf.timestamp),
-                        gst_time(self.expected_ts)))
+            #if diff > buf.timestamp or diff > 1 * gst.SECOND:
+            #    logInfo("expected %s got %s" % (gst_time(prev_buf.timestamp),
+            #            gst_time(self.expected_ts)))
 
-                self.prev_buf = buf
-                self.expected_ts = self.segment.start
+            #    self.prev_buf = buf
+            #    self.expected_ts = self.segment.start
 
-                return gst.FLOW_OK
+            #    return gst.FLOW_OK
+
+
 
         if prev_buf.duration == gst.CLOCK_TIME_NONE \
                 and buf.timestamp != gst.CLOCK_TIME_NONE \
@@ -414,9 +431,13 @@ class TimeoutCall(object):
         self.args = args
         self.kw = kw
 
+    def callCallback(self, *args, **kw):
+        self.call = None
+        self.callback(*args, **kw)
+
     def start(self):
         assert self.call is None
-        self.call = self.callLater(self.timeout, self.callback,
+        self.call = self.callLater(self.timeout, self.callCallback,
                 *self.args, **self.kw)
 
     def cancel(self):
@@ -431,41 +452,67 @@ class TimeoutCall(object):
 
 
 class DumpService(Service):
-    def __init__(self, uri, outputFilename, linkTimeout=DEFAULT_LINK_TIMEOUT,
-            eosTimeout=DEFAULT_EOS_TIMEOUT):
+    def __init__(self, uri, outputFilename, linkTimeout=None,
+            eosTimeout=None, muxer=None):
         self.uri = uri
         self.outputFilename = outputFilename
         self.pipeline = None
         self.exitStatus = None
-        self.linkTimeout = TimeoutCall(linkTimeout, self.linkTimeoutCb)
-        self.eosTimeout = TimeoutCall(eosTimeout, self.eosTimeoutCb)
+        if linkTimeout is None:
+            linkTimeout = DEFAULT_LINK_TIMEOUT
+        if eosTimeout is None:
+            eosTimeout = DEFAULT_EOS_TIMEOUT
+        self.linkTimeout = linkTimeout
+        self.eosTimeout = eosTimeout
+        if muxer is None:
+            muxer = DEFAULT_MUXER + "mux"
+        self.muxerFactory = muxer
+        self.linkTimeoutCall = TimeoutCall(linkTimeout, self.linkTimeoutCb)
+        self.eosTimeoutCall = TimeoutCall(eosTimeout, self.eosTimeoutCb)
         self.blockedPads = []
+        self.inShutdown = False
+        self.shutdownDeferred = None
+        self.duration = gst.CLOCK_TIME_NONE
 
     def startService(self):
+        assert self.shutdownDeferred is None
+        self.shutdownDeferred = defer.Deferred()
+        self.startPipeline()
+        Service.startService(self)
+
+    def startPipeline(self):
         if self.pipeline is not None:
             raise DumpError("dump already started")
 
         self.buildPipeline()
 
-        self.linkTimeout.start()
+        self.linkTimeoutCall.start()
         self.pipeline.set_state(gst.STATE_PLAYING)
 
-        Service.startService(self)
-
     def stopService(self, stopReactor=False):
-        if self.pipeline is not None:
-            # shutdown() calls reactor.stop() which in turn calls
-            # stopService(). So we need to call shutdown only if shutdown hasn't
-            # been called yet.
-            self.shutdown(EXIT_OK, stopReactor)
         Service.stopService(self)
+        if self.pipeline is not None:
+            self.forceEos()
+        else:
+            self.shutdown(EXIT_OK, stopReactor)
+
+        return self.shutdownDeferred
+
+    def findDuration(self):
+        try:
+            duration, fmt = self.pipeline.query_duration(gst.FORMAT_TIME)
+            self.duration = duration
+        except gst.QueryError:
+            pass
 
     def busEosCb(self, bus, message):
         logInfo("gstreamer eos")
-        self.eosTimeout.cancel()
-        fast_start = self.muxer.props.faststart_file
-        os.unlink(fast_start)
+        self.eosTimeoutCall.cancel()
+        if self.muxerFactory == "qtmux":
+            fast_start = self.muxer.props.faststart_file
         self.shutdown(EXIT_OK)
+        if self.muxerFactory == "qtmux":
+            os.unlink(fast_start)
 
     def busErrorCb(self, bus, message):
         gerror, debug = message.parse_error()
@@ -488,7 +535,7 @@ class DumpService(Service):
         if codec is None:
             return
 
-        self.linkTimeout.cancel()
+        self.linkTimeoutCall.cancel()
 
         logInfo("found %s codec %s" % (codec.codecType, codec.caps.to_string()[:500]))
 
@@ -514,9 +561,9 @@ class DumpService(Service):
 
         queuePad = queue.get_pad("src")
         if codec.codecType == 'audio':
-            name = "audio_%d"
+            name = muxerTemplates[self.muxerFactory]["audio"]
         else:
-            name = "video_%d"
+            name = muxerTemplates[self.muxerFactory]["video"]
         muxerPad = self.muxer.get_request_pad(name)
         try:
             queuePad.link(muxerPad)
@@ -558,8 +605,9 @@ class DumpService(Service):
         self.uridecodebin.connect("pad-added", self.decodebinPadAddedCb)
         self.uridecodebin.connect("no-more-pads", self.decodebinNoMorePadsCb)
 
-        self.muxer = gst.element_factory_make("qtmux")
-        self.muxer.props.faststart = True
+        self.muxer = gst.element_factory_make(self.muxerFactory)
+        if self.muxerFactory == "qtmux":
+            self.muxer.props.faststart = True
         self.muxer.set_locked_state(True)
         self.filesink = gst.element_factory_make("filesink")
         self.filesink.props.location = self.outputFilename
@@ -570,16 +618,33 @@ class DumpService(Service):
     def cleanPipeline(self):
         self.pipeline.set_state(gst.STATE_NULL)
         self.pipeline = None
+        self.linkTimeoutCall.cancel()
+        self.eosTimeoutCall.cancel()
 
     def shutdown(self, exitStatus, stopReactor=True):
-        exit = dict((v, k) for k, v in globals().iteritems()
-                if k.startswith("EXIT_"))[exitStatus]
+        if self.inShutdown:
+            return
+
+        self.inShutdown = True
+        self.shutdownReal(exitStatus, stopReactor)
+        self.inShutdown = False
+
+    def shutdownReal(self, exitStatus, stopReactor=True):
+        # shutdown() calls reactor.stop() which in turn calls
+        # stopService(). So we need to call shutdown only if shutdown hasn't
+        # been called yet.
+        exit = exitStatusName(exitStatus)
         logInfo("shutdown %s" % exit)
         self.exitStatus = exitStatus
 
         self.cleanPipeline()
-        if stopReactor:
-            reactor.stop()
+
+        dfr = self.shutdownDeferred
+        self.shutdownDeferred = None
+        dfr.callback(self)
+
+        #if stopReactor:
+        #    reactor.stop()
 
     def linkTimeoutCb(self):
         logError("couldn't find any compatible streams")
@@ -595,15 +660,18 @@ class DumpService(Service):
         reactor.callFromThread(self.forceEos)
 
     def forceEos(self):
+        if self.pipeline is None:
+            return
+        self.findDuration()
         logInfo("forcing EOS")
-        self.eosTimeout.start()
+        self.eosTimeoutCall.start()
         self.doControlledShutdown()
 
     def doControlledShutdown(self):
         logInfo("doing regular controlled shutdown")
         #self.pipeline.send_event(gst.event_new_eos())
         for pad in self.muxer.sink_pads():
-            pad.send_event(gst.event_new_eos())
+            threads.deferToThread(pad.send_event, gst.event_new_eos())
 
     def eosTimeoutCb(self):
         self.shutdown(EXIT_EOS_TIMEOUT)
@@ -613,6 +681,7 @@ class Options(BaseOptions):
     synopsis = ""
     optParameters = [
             ["timeout", "t", DEFAULT_LINK_TIMEOUT, "timeout"],
+            ["muxer", "m", DEFAULT_MUXER, "muxer"],
         ]
 
     optFlags = [
@@ -648,17 +717,13 @@ if __name__ == "__main__":
     if not options["quiet"]:
         log.startLogging(sys.stdout, setStdout=False)
 
-    dump = DumpService(options["input"], options["output"], options["timeout"])
+    dump = DumpService(options["input"], options["output"], options["timeout"],
+        muxer=options["muxer"] + "mux")
     dump.setServiceParent(application)
 
     appService = IService(application)
     reactor.callWhenRunning(appService.startService)
     reactor.addSystemEventTrigger("before", "shutdown", appService.stopService)
-
-    # add SIGINT handler before calling reactor.run() which would otherwise
-    # install twisted's SIGINT handler
-    signal.signal(signal.SIGINT, dump.sigInt)
-    signal.signal(signal.SIGUSR2, dump.sigUsr2)
 
     reactor.run()
 
