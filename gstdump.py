@@ -114,6 +114,7 @@ class LogTimestamps(gst.Element):
         self.sinkpad = gst.Pad(self.sinktemplate)
         self.sinkpad.set_event_function(self.sink_event)
         self.sinkpad.set_setcaps_function(self.sink_setcaps)
+        self.sinkpad.set_getcaps_function(self.sink_getcaps)
         self.sinkpad.set_chain_function(self.chain)
         self.add_pad(self.sinkpad)
 
@@ -135,6 +136,12 @@ class LogTimestamps(gst.Element):
 
     def sink_setcaps(self, pad, caps):
         return self.srcpad.set_caps(caps)
+
+    def sink_getcaps(self, pad):
+        peer = self.srcpad.get_peer()
+        if peer is not None:
+            return peer.get_caps()
+        return self.srcpad.get_caps()
 
     def chain(self, pad, buf):
         ts = buf.timestamp
