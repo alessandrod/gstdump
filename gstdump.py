@@ -272,7 +272,10 @@ class DumpService(Service):
             fast_start = self.muxer.props.faststart_file
         self.shutdown(EXIT_OK)
         if self.muxerFactory == "qtmux":
-            os.unlink(fast_start)
+            try:
+                os.unlink(fast_start)
+            except OSError, e:
+                pass
 
     def busErrorCb(self, bus, message):
         gerror, debug = message.parse_error()
