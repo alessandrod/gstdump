@@ -99,100 +99,6 @@ class VideoCodec(Codec):
 class AudioCodec(Codec):
     codecType = "audio"
 
-class H264Parser(gst.Element):
-    __gstdetails__ = ("h264Parser", "Filter/Video",
-            "Blah", "Alessandro Decina")
-
-    sinktemplate = gst.PadTemplate ("sink",
-            gst.PAD_SINK, gst.PAD_ALWAYS, gst.Caps("video/x-h264"))
-    srctemplate = gst.PadTemplate ("src",
-            gst.PAD_SRC, gst.PAD_ALWAYS, gst.Caps("video/x-h264"))
-
-    def __init__(self):
-        gst.Element.__init__(self)
-
-        self.sinkpad = gst.Pad(self.sinktemplate)
-        self.sinkpad.set_setcaps_function(self.sink_setcaps)
-        self.sinkpad.set_chain_function(self.chain)
-        self.add_pad(self.sinkpad)
-
-        self.srcpad = gst.Pad(self.srctemplate)
-        self.add_pad(self.srcpad)
-
-        self.buffers = []
-
-    def sink_setcaps(self, pad, caps):
-        return self.srcpad.set_caps(caps)
-
-    def chain(self, pad, buf):
-        caps = pad.props.caps
-        if caps is None or not caps[0].has_key("width"):
-            logInfo("%s incomplete caps, buffering %s" % (self, caps))
-            self.buffers.append(buf)
-            return gst.FLOW_OK
-
-        ret = gst.FLOW_OK
-        if self.buffers:
-            logInfo("%s caps complete, pushing out buffered buffers" % self)
-
-            while ret == gst.FLOW_OK:
-                try:
-                    pbuf = self.buffers.pop(0)
-                except IndexError:
-                    break
-                pbuf.set_caps(self.srcpad.props.caps)
-                ret = self.srcpad.push(pbuf)
-
-            self.buffers = []
-
-        if ret != gst.FLOW_OK:
-            return ret
-
-        buf.set_caps(self.srcpad.props.caps)
-        res = self.srcpad.push(buf)
-        return res
-
-gobject.type_register(H264Parser)
-gst.element_register(H264Parser, "twih264parse", gst.RANK_MARGINAL)
-
-class H264Codec(VideoCodec):
-    def createBinReal(self):
-        codecBin = gst.Bin()
-
-        self.h264parse = h264parse = gst.element_factory_make("h264parse")
-        self.h264parse.props.output_format = 0
-        twih264parse = H264Parser()
-        fixTimestamps = FixTimestamps()
-        codecBin.add(h264parse, twih264parse, fixTimestamps)
-
-        h264parse.link(twih264parse)
-        twih264parse.link(fixTimestamps)
-
-        sinkpad = gst.GhostPad("sink", h264parse.get_pad("sink"))
-        srcpad = gst.GhostPad("src", fixTimestamps.get_pad("src"))
-
-        # workaround a bug in h264parse, fixed by -bad 52f5f4
-        pad = h264parse.get_pad("src")
-        pad.connect("notify::caps", self.checkCaps)
-
-        codecBin.add_pad(sinkpad)
-        codecBin.add_pad(srcpad)
-
-        return codecBin
-
-    def checkCaps(self, pad, pspec):
-        if pad.props.caps is None or pad.props.caps[0].has_key("width"):
-            return
-
-        logInfo("pad %s setting caps again" % pad)
-        # set the caps again so they get updated again and width/height are
-        # filled with correct values
-        caps = pad.props.caps
-        caps = gst.Caps(caps)
-        caps[0]["width"] = 42
-        caps[0]["height"] = 42
-        self.h264parse.get_pad("sink").set_caps(caps)
-
 class LogTimestamps(gst.Element):
     __gstdetails__ = ("LogTimestamps", "Filter",
             "Blah", "Alessandro Decina")
@@ -242,122 +148,8 @@ gobject.type_register(LogTimestamps)
 gst.element_register(LogTimestamps, "logtimestamps", gst.RANK_MARGINAL)
 
 
-class FixTimestamps(gst.Element):
-    __gstdetails__ = ("FixTimestamps", "Filter",
-            "Blah", "Alessandro Decina")
-
-    sinktemplate = gst.PadTemplate ("sink",
-            gst.PAD_SINK, gst.PAD_ALWAYS, gst.Caps("ANY"))
-    srctemplate = gst.PadTemplate ("src",
-            gst.PAD_SRC, gst.PAD_ALWAYS, gst.Caps("ANY"))
-
-    def __init__(self):
-        gst.Element.__init__(self)
-
-        self.sinkpad = gst.Pad(self.sinktemplate)
-        self.sinkpad.set_event_function(self.sink_event)
-        self.sinkpad.set_setcaps_function(self.sink_setcaps)
-        self.sinkpad.set_chain_function(self.chain)
-        self.add_pad(self.sinkpad)
-
-        self.srcpad = gst.Pad(self.srctemplate)
-        self.add_pad(self.srcpad)
-
-        self.reset()
-
-    def reset(self):
-        self.segment = gst.Segment()
-        self.prev_buf = None
-        self.expected_ts = gst.CLOCK_TIME_NONE
-
-    def sink_event(self, pad, event):
-        if event.type == gst.EVENT_NEWSEGMENT:
-            tup = event.parse_new_segment_full()
-            update, rate, applied_rate, fmt, start, stop, time = tup
-            self.segment.set_newsegment_full(update, rate, applied_rate, fmt,
-                    start, stop, time)
-
-            self.expected_ts = start
-
-        elif event.type == gst.EVENT_FLUSH_STOP:
-            self.reset()
-
-        return self.sinkpad.event_default(event)
-
-    def sink_setcaps(self, pad, caps):
-        return self.srcpad.set_caps(caps)
-
-    def chain(self, pad, buf):
-        if self.expected_ts == gst.CLOCK_TIME_NONE:
-            logError("no expected ts... no NEWSEGMENT")
-
-            return gst.FLOW_UNEXPECTED
-
-        gst_time = gst.TIME_ARGS
-
-        if self.prev_buf is None:
-            self.prev_buf = buf
-
-            return gst.FLOW_OK
-
-        prev_buf = self.prev_buf
-        self.prev_buf = buf
-
-        if prev_buf.timestamp == gst.CLOCK_TIME_NONE \
-                or prev_buf.timestamp > buf.timestamp:
-            prev_buf.timestamp = self.expected_ts
-
-        #elif prev_buf.timestamp != self.expected_ts:
-            #if prev_buf.timestamp > self.expected_ts:
-            #    diff = prev_buf.timestamp - self.expected_ts
-            #else:
-            #    diff = self.expected_ts - prev_buf.timestamp
-
-            #if diff > buf.timestamp or diff > 1 * gst.SECOND:
-            #    logInfo("expected %s got %s" % (gst_time(prev_buf.timestamp),
-            #            gst_time(self.expected_ts)))
-
-            #    self.prev_buf = buf
-            #    self.expected_ts = self.segment.start
-
-            #    return gst.FLOW_OK
-
-
-
-        if prev_buf.duration == gst.CLOCK_TIME_NONE \
-                and buf.timestamp != gst.CLOCK_TIME_NONE \
-                and buf.timestamp > prev_buf.timestamp:
-            duration = buf.timestamp - prev_buf.timestamp
-            prev_buf.duration = duration
-
-        self.expected_ts = prev_buf.timestamp + prev_buf.duration
-
-        prev_buf.set_caps(self.srcpad.props.caps)
-        return self.srcpad.push(prev_buf)
-
-gobject.type_register(FixTimestamps)
-gst.element_register(FixTimestamps, "fixtimestamps", gst.RANK_MARGINAL)
-
-class RawIntAudioCodec(AudioCodec):
-    def createBinReal(self):
-        codecBin = gst.Bin()
-        encoder = gst.element_factory_make("faac")
-        fixTimestamps = FixTimestamps()
-
-        codecBin.add(encoder, fixTimestamps)
-        encoder.link(fixTimestamps)
-
-        sinkpad = gst.GhostPad("sink", encoder.get_pad("sink"))
-        srcpad = gst.GhostPad("src", fixTimestamps.get_pad("src"))
-
-        codecBin.add_pad(sinkpad)
-        codecBin.add_pad(srcpad)
-
-        return codecBin
-
-
 SUPPORTED_CODECS = [
-        H264Codec("video/x-h264"),
+        VideoCodec("video/x-h264", 'h264parse'),
         VideoCodec("video/mpeg, mpegversion=(int)4", "mpeg4videoparse"),
         VideoCodec("video/mpeg, mpegversion={1, 2}", "mpegvideoparse"),
         VideoCodec("image/jpeg"),
@@ -365,8 +157,7 @@ SUPPORTED_CODECS = [
         VideoCodec("video/x-raw-yuv", "ffmpegcolorspace ! x264enc"),
         #AudioCodec("audio/mpeg, mpegversion=(int){2, 4}", "aacparse"),
         AudioCodec("audio/mpeg, mpegversion=(int)1, layer=[1, 3]", "mp3parse"),
-        #AudioCodec("audio/x-raw-int", "faac"),
-        RawIntAudioCodec("audio/x-raw-int"),
+        AudioCodec("audio/x-raw-int", "lame"),
     ]
 
 def findCodecForCaps(caps, codecs):
@@ -381,46 +172,6 @@ def supportedCodecCaps(caps, codecs):
 
 class DumpError(Exception):
     pass
-
-class UnParser(gst.Element):
-    __gstdetails__ = ("UnParser", "Parser",
-            'I unparse parsed stuff (for real)', 'Alessandro Decina')
-
-    sinktemplate = gst.PadTemplate ("sink",
-            gst.PAD_SINK, gst.PAD_ALWAYS, gst.caps_new_any())
-    srctemplate = gst.PadTemplate ("src",
-            gst.PAD_SRC, gst.PAD_ALWAYS, gst.caps_new_any())
-
-    def __init__(self):
-        gst.Element.__init__(self)
-
-        self.sinkpad = gst.Pad(self.sinktemplate)
-        self.sinkpad.set_setcaps_function(self.sink_setcaps)
-        self.sinkpad.set_chain_function(self.chain)
-        self.add_pad(self.sinkpad)
-
-        self.srcpad = gst.Pad(self.srctemplate)
-        self.add_pad(self.srcpad)
-
-    def sink_setcaps(self, pad, caps):
-        caps = gst.Caps(caps)
-        for structure in caps:
-            if structure.has_key("parsed"):
-                structure["parsed"] = False
-            if structure.has_key("framed"):
-                structure["framed"] = False
-
-        return self.srcpad.set_caps(caps)
-
-    def chain(self, pad, buf):
-        #print self, "pushing", buf.size
-        buf.set_caps(self.srcpad.props.caps)
-        res = self.srcpad.push(buf)
-        return res
-
-
-gobject.type_register(UnParser)
-gst.element_register(UnParser, "unparser", gst.RANK_MARGINAL)
 
 class TimeoutCall(object):
     call = None
@@ -543,18 +294,16 @@ class DumpService(Service):
         queue.props.max_size_bytes = 0
         queue.props.max_size_time = 0
         queue.props.max_size_buffers = 0
-        unparser = UnParser()
         codecBin = codec.createBin()
-        self.pipeline.add(unparser, codecBin, queue)
-        unparser.set_state(gst.STATE_PLAYING)
+        self.pipeline.add(codecBin, queue)
         codecBin.set_state(gst.STATE_PLAYING)
         queue.set_state(gst.STATE_PLAYING)
 
         try:
-            pad.link(unparser.get_pad("sink"))
-            gst.element_link_many(unparser, codecBin, queue)
+            pad.link(codecBin.get_pad("sink"))
+            gst.element_link_many(codecBin, queue)
         except gst.LinkError, e:
-            logError("couldn't link unparser codecBin and queue %s" % e)
+            logError("couldn't link codecBin and queue %s" % e)
             self.callLater(0, self.shutdown, EXIT_ERROR)
 
             return
