@@ -8,6 +8,10 @@
 #
 # Author: Alessandro Decina <alessandro.d@gmail.com>
 
+if __name__ == "__main__":
+    from twisted.internet import glib2reactor
+    glib2reactor.install()
+
 import os
 
 import pygtk
@@ -19,8 +23,6 @@ import pygst
 pygst.require("0.10")
 import gst
 
-#from twisted.internet import glib2reactor
-#glib2reactor.install()
 from twisted.internet import reactor, defer, threads
 from twisted.application.service import IService, Service
 from twisted.python import log
